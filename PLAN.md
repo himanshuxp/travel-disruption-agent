@@ -1,8 +1,8 @@
 # Plan: AI Travel Disruption & Autonomous Replanning Agent
 
-> Status: **plan only, no code yet.** This document is the spec we'll build against.
-> Assumptions I had to make are collected in [§12](#12-assumptions-to-confirm) — correct
-> those before we write the first line.
+> Status: **M0 and M1 built** (see [README](README.md#m0--m1-whats-built)). M2+ are still just
+> this document. Assumptions I had to make are collected in
+> [§12](#12-assumptions-to-confirm) — correct those before M2.
 
 ## 1. The problem
 
@@ -172,14 +172,22 @@ Therefore:
 Never let the model be the authority on whether a flight exists. Same principle as
 `calculate` not calling `eval`: the sandbox is the invariant, the prompt is a courtesy.
 
+> **Observed in M1, 2026-10-01.** The live run got the *reasoning* right -- it found
+> AF 0089 and correctly flagged that VY 8901 breaks the activity constraint -- while
+> inventing a departure and arrival time for the already-disrupted BA 0431 (it wrote
+> 00:15 EDT / 13:15 CEST; the world had 22:40 EDT / 11:40 CEST). Note it invented times
+> for a flight it had not been asked to rebook. Prompted not to restate times, it
+> stopped; but "stopped doing it when told" is not enforcement. **This is the concrete
+> case for M4, and it is the first thing to build after M2.**
+
 ## 8. Milestones
 
 Each one ends in something runnable and demonstrable.
 
 | # | Deliverable | Done when |
 | --- | --- | --- |
-| **M0** | Loop + simulated world, **no LLM** | Ticking clock, scripted replan on a delay. Proves the plumbing. |
-| **M1** | LLM drives a single-leg disruption | `poll_disruptions` → `find_alternatives` → proposed plan |
+| **M0** | Loop + simulated world, **no LLM** | ✅ Ticking clock, deterministic scripted replan on the delay. `--no-llm`. |
+| **M1** | LLM drives a single-leg disruption | ✅ `poll_disruptions` → `find_alternatives` → two candidates |
 | **M2** | Multi-leg blast radius | `analyse_impact` implemented; delay cascades ≥2 legs correctly |
 | **M3** | Constraints & trade-offs | Agent picks between two valid options and justifies it |
 | **M4** | Approval + validator | `validate_plan` blocks a bad plan; commit requires approval |

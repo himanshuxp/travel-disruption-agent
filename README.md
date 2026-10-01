@@ -3,69 +3,117 @@
 An agent that notices a travel disruption, works out its blast radius across a whole
 itinerary, and proposes a replan that is actually workable.
 
-> **Status: plan only.** No code yet. See [PLAN.md](PLAN.md) for the spec and the
-> milestones we'll build against.
+Built from the [plan](PLAN.md). **M0 and M1 are done; M2+ are not.**
 
 ## The idea
 
-You fly BOS → AMS → BCN with a 40-minute connection in Amsterdam and a prepaid hotel in
-Barcelona. Your first flight is delayed 95 minutes. The connection becomes unmakeable,
-the second flight auto-cancels, and now your hotel night is wasted too.
+You fly BOS → AMS → BCN with a 40-minute connection in Amsterdam, a prepaid
+non-refundable hotel in Barcelona, and a timed Sagrada Família ticket. Your first flight
+is delayed 95 minutes, so the connection becomes unmakeable and everything downstream is
+in doubt.
 
-A rules engine swaps in the next flight. An agent notices the delay **cascades three
-bookings downstream**, weighs a later arrival against an earlier start time you didn't
-ask for, checks the replacement doesn't route you somewhere your visa doesn't reach —
-and then tells you why it chose what it chose.
+A rules engine swaps in the next flight. The interesting part is that the delay cascades
+three bookings, that the cheapest replacement fare is the *worst* outcome, and that the
+best option is an earlier flight the traveller can still catch.
 
-## Why this is hard enough to be interesting
+## Run it
 
-The replacement flight is a lookup. The replan is a constraint problem with soft
-preferences, and the hard part is knowing *which constraints are now in play* — which
-only becomes visible after you've understood what the disruption broke.
-
-That blast-radius step is deterministic graph work. The judgement on top of it is what
-the LLM is for. [PLAN.md §2](PLAN.md#2-why-this-needs-an-agent-not-a-rules-engine) has the
-comparison table.
-
-## What the demo should look like
-
-A ticking clock, events arriving live, the itinerary mutating underneath, and the agent
-responding without being asked. [PLAN.md §4](PLAN.md#4-the-dynamic-demo-loop) has the
-target output:
-
-```
-  [18:42]  ! BOS-AMS delayed 95 min, now departs 20:25
-           - BOS-AMS now lands 23:10; 40-min AMS connection becomes 20 min
-           - AMS-BCN at risk. Replanning...
-
-  Candidate A  BOS-AMS 20:25 -> AMS 23:10 | AMS-BCN next day 06:15 | hotel +1 night
-               total +1 day, +$180
-  Candidate B  Rebook BOS-AMS 17:20 -> AMS 20:05 | AMS-BCN unchanged 23:30 | no changes after
-               total +0 days, +$95, but you leave work 2h earlier
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env          # then paste your key in
 ```
 
-## Build order
+**M0, no API key, no quota** — the whole simulation with a deterministic scripted replan:
 
-M0 loop + simulated world (no LLM) → M1 single-leg LLM replan → M2 multi-leg blast
-radius → M3 constraints and trade-offs → M4 approval and validator → M5 real data.
+```bash
+.venv/bin/python main.py --no-llm
+```
 
-M0 is deliberately LLM-free: if the loop works with a scripted planner, the model only
-has to do the judgement. Full table in [PLAN.md §8](PLAN.md#8-milestones).
+**M1, the real thing** — same world, the model plans the replan:
 
-## Two decisions worth knowing now
+```bash
+.venv/bin/python main.py
+```
 
-**The agent can never invent a flight.** `commit_replan` refuses any leg whose flight
-number, times, or cost don't appear verbatim in what `find_alternatives` returned. That
-check is code, not a prompt — same principle as `calculate` never calling `eval`.
-[PLAN.md §7](PLAN.md#the-safety-property-no-invented-flights).
+Useful flags: `--ticks N` (default 8), `--instant` (no sleep between ticks).
 
-**Simulated data in v0.** Live flight APIs need credentials, rate-limit, and fail exactly
-when a demo needs them. A seeded in-process world sits behind the same tool interface, so
-the real feed is a one-module swap later. [PLAN.md §4](PLAN.md#why-simulated-data-not-live-flight-apis).
+## M0 + M1: what's built
 
-## Open questions
+```
+models.py   Leg / Constraint / Trip, exactly PLAN.md §6. Aware UTC, no exceptions.
+world.py    Seeded world: the trip, the clock, the event queue, the flights that exist.
+tools.py    get_itinerary / poll_disruptions / find_alternatives
+agent.py    Manual dispatch loop + the retry/fallback ladder
+main.py     The ticking clock
+tests/      15 offline checks, stdlib only, no API key
+```
 
-[PLAN.md §11](PLAN.md#11-open-questions) lists what's still undecided — most importantly
-whether there's a formal problem statement with judging criteria to satisfy. The
-assumptions I made are in [§12](PLAN.md#12-assumptions-to-confirm); correcting those
-early is much cheaper than reworking code later.
+Run the tests with:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -t .
+```
+
+### Quota is the design constraint
+
+The model is **not** called on every tick. `poll_disruptions()` is called from ordinary
+Python and only a non-empty result spends a request, so a full 8-tick demo costs one
+agent invocation rather than eight. `LLM_REQUEST_BUDGET` (default 20) is a hard ceiling,
+and the counter is printed on every tick and every request.
+
+Worth knowing: a degraded API day makes this much more expensive. One M1 run hit a burst
+of 503s and 429s, and the retry ladder burned 10 of the 20 requests on a single
+disruption before the fallback model answered. The ladder is correct behaviour, but on a
+bad day lower `LLM_REQUEST_BUDGET` and expect fewer retries to succeed.
+
+### Timezones
+
+Everything is stored as aware UTC and converted only for display, because travel bugs are
+timezone bugs. The scenario is anchored in October 2026, when Boston is EDT (UTC−4, US DST
+ends 1 Nov) and both Amsterdam and Barcelona are CEST (UTC+2, EU DST ends 25 Oct). So AMS
+and BCN share an offset — the AMS-BCN leg crosses no timezone at all — and sit exactly 6h
+ahead of Boston.
+
+No time is written down twice. Each leg's start is a real local wall-clock time in the
+right zone and its end is `start + flight_time`, which is why the delay moves both
+endpoints and cannot change the 7h flight length.
+
+### The 95-minute cascade
+
+| | booked | after the delay |
+|---|---|---|
+| BA 0431 departs | Oct 01 21:05 EDT | Oct 01 22:40 EDT |
+| BA 0431 lands | Oct 02 10:05 CEST | Oct 02 11:40 CEST |
+| connection at AMS | +40 min | **−55 min** |
+
+The connection is already 55 minutes gone when the delay lands, so `AMS-BCN-1` cannot
+fly as booked and the hotel night and activity are suddenly in question.
+
+### The trap
+
+`IB 3108` at **+$60** is the cheapest fare in the whole table and the worst outcome: next
+day, so the non-refundable hotel night is burned and the timed ticket is lost. The right
+answer is usually `AF 0089` at +$320, because it leaves *earlier* than the delayed flight
+and lands three hours before the onward connection, leaving the rest of the trip alone.
+
+The live M1 run found that on its own, and correctly named the activity constraint as
+broken when it took the cheap option instead.
+
+## What is not built yet
+
+`analyse_impact`, `validate_plan` and `commit_replan` are deliberately absent. The
+blast-radius lines in the demo output are printed by `main.py` as a clearly-labelled
+stopgap, so M1 doesn't pretend to a capability that isn't there.
+
+**The agent has already been caught inventing times.** On the first live run it proposed
+the disrupted `BA 0431` as departing `00:15 EDT` and arriving `13:15 CEST`, when the
+world had `22:40 EDT` and `11:40 CEST` — and it invented them for a flight nobody asked
+it to rebook. Prompted not to restate times it stopped, but a prompt is not enforcement.
+`validate_plan` (M4) is the real fix, and it should be the first thing after M2.
+[PLAN.md §7](PLAN.md#the-safety-property-no-invented-flights) has the write-up.
+
+## Next
+
+M2 — implement `analyse_impact` as a real tool and let the model walk the cascade itself,
+instead of `main.py` printing it.
