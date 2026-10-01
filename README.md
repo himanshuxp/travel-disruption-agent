@@ -3,7 +3,7 @@
 An agent that notices a travel disruption, works out its blast radius across a whole
 itinerary, and proposes a replan that is actually workable.
 
-Built from the [plan](PLAN.md). **M0 and M1 are done; M2+ are not.**
+Built from the [plan](PLAN.md). **M0, M1 and M2 are done, along with the core of M4.**
 
 ## The idea
 
@@ -43,10 +43,10 @@ Useful flags: `--ticks N` (default 8), `--instant` (no sleep between ticks).
 ```
 models.py   Leg / Constraint / Trip, exactly PLAN.md §6. Aware UTC, no exceptions.
 world.py    Seeded world: the trip, the clock, the event queue, the flights that exist.
-tools.py    get_itinerary / poll_disruptions / find_alternatives
+tools.py    get_itinerary / poll_disruptions / analyse_impact / find_alternatives / commit_replan
 agent.py    Manual dispatch loop + the retry/fallback ladder
 main.py     The ticking clock
-tests/      15 offline checks, stdlib only, no API key
+tests/      48 offline checks, stdlib only, no API key
 ```
 
 Run the tests with:
@@ -59,13 +59,13 @@ Run the tests with:
 
 The model is **not** called on every tick. `poll_disruptions()` is called from ordinary
 Python and only a non-empty result spends a request, so a full 8-tick demo costs one
-agent invocation rather than eight. `LLM_REQUEST_BUDGET` (default 20) is a hard ceiling,
+agent invocation rather than eight. `LLM_REQUEST_BUDGET` (default 8) is a hard ceiling,
 and the counter is printed on every tick and every request.
 
 Worth knowing: a degraded API day makes this much more expensive. One M1 run hit a burst
-of 503s and 429s, and the retry ladder burned 10 of the 20 requests on a single
-disruption before the fallback model answered. The ladder is correct behaviour, but on a
-bad day lower `LLM_REQUEST_BUDGET` and expect fewer retries to succeed.
+of 503s and 429s, and the retry ladder burned 10 requests on a single disruption before
+the fallback model answered. The ladder is correct behaviour, but the cap is now low
+enough to bite: when it is hit the run says so and stops rather than quietly retrying.
 
 ### Timezones
 
@@ -102,18 +102,33 @@ broken when it took the cheap option instead.
 
 ## What is not built yet
 
-`analyse_impact`, `validate_plan` and `commit_replan` are deliberately absent. The
-blast-radius lines in the demo output are printed by `main.py` as a clearly-labelled
-stopgap, so M1 doesn't pretend to a capability that isn't there.
+`validate_plan` is still absent, and M3 is untouched. The M1 invention below is now
+*enforced* rather than merely discouraged: `commit_replan` resolves each leg's flight
+through the world itself, so the times in a committed plan are always the world's
+numbers, and it refuses any flight or time that `find_alternatives` did not return.
+
+### The commit gate
+
+`commit_replan(plan, rationale)` runs four gates and mutates nothing until the last one:
+
+1. **Parse** `leg = FLIGHT` lines. Prose is tolerated; one replan per call.
+2. **Verify** every flight and any quoted times against `find_alternatives` output *for
+   that leg*. `find_alternatives` also filters departed flights, so this rules out
+   anything that has already left.
+3. **Refuse** any plan that breaks a hard constraint: an unmakeable connection, a missed
+   non-refundable timed slot, or a non-refundable hotel night landed on a later calendar
+   day than it begins.
+4. **Ask.** An explicit `y/n` prompt in `main.py`, injected as
+   `build_tools(world, approve=...)`. No handler wired means no mutation.
 
 **The agent has already been caught inventing times.** On the first live run it proposed
 the disrupted `BA 0431` as departing `00:15 EDT` and arriving `13:15 CEST`, when the
 world had `22:40 EDT` and `11:40 CEST` — and it invented them for a flight nobody asked
 it to rebook. Prompted not to restate times it stopped, but a prompt is not enforcement.
-`validate_plan` (M4) is the real fix, and it should be the first thing after M2.
+Gate 2 is the enforcement, and `tests/test_tools.py` asserts it on exactly that case.
 [PLAN.md §7](PLAN.md#the-safety-property-no-invented-flights) has the write-up.
 
 ## Next
 
-M2 — implement `analyse_impact` as a real tool and let the model walk the cascade itself,
-instead of `main.py` printing it.
+M3 — constraints and trade-offs: have the agent pick between two valid options and
+justify the choice, rather than proposing two and letting a human choose.

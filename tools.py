@@ -160,7 +160,7 @@ def build_tools(world: World, approve=None) -> dict:
             rows.append(row)
         return rows
 
-    def analyse_impact(leg_id: str) -> str:
+    def analyse_impact(leg_id: str = "") -> str:
         try:
             leg = world.leg(leg_id)
             if leg is None:
@@ -182,8 +182,10 @@ def build_tools(world: World, approve=None) -> dict:
             money, broken_conns, at_risk = 0.0, 0, []
             for row in rows:
                 nxt = row["leg"]
-                money_flag = "" if nxt.refundable else f"  ${nxt.cost_usd:,.0f} NON-REFUNDABLE"
-                if row["state"] != "OK":
+                hurt = row["state"] != "OK"
+                money_flag = (f"  ${nxt.cost_usd:,.0f} NON-REFUNDABLE"
+                              if hurt and not nxt.refundable else "")
+                if hurt:
                     money += row.get("money", 0.0)
                 if nxt.kind == "flight":
                     if row["ok"]:
@@ -200,7 +202,8 @@ def build_tools(world: World, approve=None) -> dict:
                                    f"{fmt(nxt.start - timedelta(minutes=row['need']), nxt.origin)} "
                                    f"or earlier, to keep the {row['need']} min connection")
                 else:
-                    at_risk.append(nxt)
+                    if hurt:
+                        at_risk.append(nxt)
                     out.append(f"  {nxt.id}  {row['state']}{money_flag}")
                     out.append(f"    {nxt.kind:<9} {both(nxt.start, nxt.destination, home)} -> "
                                f"{both(nxt.end, nxt.destination, home)}")
@@ -220,6 +223,8 @@ def build_tools(world: World, approve=None) -> dict:
                            f"{', '.join(l.id for l in at_risk)}.")
             if broken_conns:
                 out.append(f"UNMAKEABLE: {broken_conns} downstream connection(s).")
+            if not at_risk and not broken_conns:
+                out.append("Nothing downstream of this leg is affected.")
             out.append("No flight is named here and no time is computed for one. "
                        "Call find_alternatives, then compare each arrival against the "
                        "deadlines above.")
@@ -227,7 +232,7 @@ def build_tools(world: World, approve=None) -> dict:
         except Exception as exc:
             return f"error: {exc}"
 
-    def find_alternatives(leg_id: str, avoid: str = "") -> str:
+    def find_alternatives(leg_id: str = "", avoid: str = "") -> str:
         try:
             leg = world.leg(leg_id)
             if leg is None:
@@ -347,7 +352,7 @@ def build_tools(world: World, approve=None) -> dict:
                            f"{(end - start).total_seconds() / 3600:.0f}h night, the rest gone.")
         return out
 
-    def commit_replan(plan: str, rationale: str) -> str:
+    def commit_replan(plan: str = "", rationale: str = "") -> str:
         try:
             rows, bad = _parse_plan(plan)
             if not rows:
