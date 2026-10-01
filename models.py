@@ -13,12 +13,13 @@ class Leg:
     kind: str                # flight | hotel | train | activity
     start: datetime          # aware, UTC
     end: datetime            # aware, UTC
-    status: str              # scheduled | delayed | cancelled | done
+    status: str              # scheduled | delayed | cancelled | rebooked | done
     origin: str | None       # IATA
     destination: str | None
     booking_ref: str | None
     refundable: bool
     cost_usd: float
+    flight: str | None = None   # "AF 0089", set on rebooking; None for hotel/activity
 
 
 @dataclass

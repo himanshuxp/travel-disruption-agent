@@ -13,35 +13,10 @@ import sys
 import time
 
 from tools import TOOLS, build_tools, check_tool_sync
-from world import FLIGHT_NO, TICK_MINUTES, World, fmt
+from world import TICK_MINUTES, World, fmt
 
 TICKS = 8
 TICK_SECONDS = 1.5
-
-
-def show_cascade(world: World, event) -> None:
-    """Placeholder for `analyse_impact`, which is M2. Plain Python, no LLM.
-
-    Walks forward from the disrupted leg and reports what the delay now makes impossible.
-    """
-    leg, nxt = world.leg(event.leg_id), world.next_leg(event.leg_id)
-    print(f"           - {leg.id} now lands {fmt(leg.end, leg.destination)}")
-    if nxt is None:
-        return
-    slack = (nxt.start - leg.end).total_seconds() / 60
-    verdict = "unmakeable as booked" if slack < 0 else "still makeable"
-    print(f"           - {nxt.id} departs {fmt(nxt.start, nxt.origin or nxt.destination)}; "
-          f"connection is {slack:+.0f} min -> {verdict}")
-    if slack >= 0:
-        return
-    print("           - downstream commitments now at risk:")
-    for later in world.trip.legs:
-        if later.start <= leg.end:
-            continue
-        flag = " NON-REFUNDABLE" if not later.refundable else ""
-        when = f"check-in {fmt(later.start, later.destination)}" if later.kind == "hotel" \
-            else f"starts {fmt(later.start, later.destination)}"
-        print(f"             {later.id} ({later.kind}) {when}{flag}")
 
 
 def scripted_replan(world: World, event) -> None:
@@ -68,6 +43,25 @@ def scripted_replan(world: World, event) -> None:
     print(f"\n  [M0] {len(opts)} option(s) returned; nothing committed.\n")
 
 
+def ask_approval(summary: str, rationale: str) -> bool:
+    """The human gate for commit_replan. Nothing is mutated until this returns True.
+
+    Lives here, not in the tool, so the prompt is the program's and the tool stays
+    testable with a stub.
+    """
+    print()
+    print("  " + "-" * 66)
+    print("  COMMIT REPLAN?  Nothing is booked or paid; this only moves the simulated world.")
+    print(f"  rationale: {rationale}")
+    for line in summary.splitlines():
+        print(f"  {line.strip()}")
+    try:
+        answer = input("\n  Apply this replan? [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Travel disruption agent - M0 + M1.")
     ap.add_argument("--no-llm", action="store_true", help="scripted replan, zero model requests")
@@ -76,7 +70,7 @@ def main() -> None:
     args = ap.parse_args()
 
     world = World(seed=7)
-    impls = build_tools(world)
+    impls = build_tools(world, approve=ask_approval)
     check_tool_sync(impls)
 
     agent = client = config = None
@@ -92,7 +86,7 @@ def main() -> None:
     print(f"Trip {world.trip.id}: home ({l1.origin}) {fmt(l1.start, l1.origin)}  ->  "
           f"{l1.origin}-{l1.destination}  ->  {l2.origin}-{l2.destination}  ->  hotel in {l2.destination}")
     print(f"Connection at {l2.origin}: {(l2.start - l1.end).total_seconds() / 60:.0f} min. "
-          f"Flight {FLIGHT_NO[l1.id]} is the one at risk.\n")
+          f"Flight {world.flight_no[l1.id]} is the one at risk.\n")
 
     for tick in range(1, args.ticks + 1):
         world.tick(TICK_MINUTES if tick > 1 else 0)
@@ -110,14 +104,19 @@ def main() -> None:
         for line in impls["poll_disruptions"]().splitlines():
             print(f"{' ' * 11}{line}")
         for event in fresh:
-            show_cascade(world, event)
+            # The same blast-radius tool the model would call, so --no-llm exercises it too.
+            for line in impls["analyse_impact"](event.leg_id).splitlines():
+                print(f"{' ' * 11}{line}")
             if args.no_llm:
                 scripted_replan(world, event)
             else:
                 print("           - Replanning (agent)...\n")
                 agent.handle_disruption(client, config, impls, world, [event])
 
-    print("Loop finished. Nothing was booked or committed.")
+    rebooked = sum(1 for l in world.trip.legs if l.status == "rebooked")
+    print("Loop finished. " + ("Nothing was booked or committed." if not rebooked
+                               else f"{rebooked} leg(s) rebooked in the simulated world. "
+                                    f"Nothing was booked or paid."))
 
 
 if __name__ == "__main__":

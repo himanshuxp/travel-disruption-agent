@@ -26,6 +26,18 @@ ZONES = {BOS: ZoneInfo("America/New_York"), AMS: ZoneInfo("Europe/Amsterdam"), B
 FLIGHT_TIME = {(BOS, AMS): timedelta(hours=7), (AMS, BCN): timedelta(hours=2, minutes=5)}
 FLIGHT_NO = {"BOS-AMS-1": "BA 0431", "AMS-BCN-1": "IB 3110"}
 
+# The two hard rules that are not derivable from a leg's own times. They live here, not
+# inside the constraint strings, because `analyse_impact` and `commit_replan` have to
+# evaluate them -- and a string is not something you can compare a datetime against.
+# `build_trip` interpolates these into the human-readable constraint names, so the
+# numbers the model reads and the numbers the code checks cannot drift apart.
+MIN_CONNECTION_MINUTES = {BOS: 40, AMS: 40, BCN: 40}   # per hub, by IATA
+CHECK_IN = (2, 15, 0)                                   # day, hour, minute, local BCN
+
+
+def min_connection(hub: str) -> int:
+    return MIN_CONNECTION_MINUTES.get(hub, 40)
+
 TICK_MINUTES = 10          # simulated minutes per tick
 DELAY_MINUTES = 95
 
@@ -45,6 +57,23 @@ def fmt(dt: datetime, zone: str) -> str:
     return local(dt, zone).strftime("%b %d %H:%M %Z")
 
 
+def hhmm(dt: datetime, zone: str) -> str:
+    """Clock time only, in `zone`, e.g. '04:40 CEST'."""
+    return local(dt, zone).strftime("%H:%M %Z")
+
+
+def both(dt: datetime, here: str, there: str) -> str:
+    """One instant, shown in two zones, e.g. 'Oct 01 22:40 EDT  (Oct 02 04:40 CEST)'.
+
+    Converted, never typed: the caller names both zones, because guessing the counterpart
+    is wrong -- AMS and BCN share an offset, so a guess prints the same clock time twice
+    and reads like agreement when it is only a bug. When the two readings genuinely come
+    out identical the second is dropped rather than repeated.
+    """
+    a, b = fmt(dt, here), fmt(dt, there)
+    return a if a == b else f"{a}  ({b})"
+
+
 START_TIME = _local(1, 16, 45, BOS)   # Thu Oct 01 16:45 EDT = 20:45Z
 EVENT_AT = _local(1, 17, 15, BOS)    # announced on tick 3, 30 simulated minutes later
 
@@ -61,9 +90,9 @@ def build_trip() -> Trip:
     act = _local(2, 17, 0, BCN)
     legs = [
         Leg("BOS-AMS-1", "flight", l1_dep, l1_dep + FLIGHT_TIME[(BOS, AMS)], "scheduled",
-            BOS, AMS, "BOS-AMS-BA0431", True, 612.0),
+            BOS, AMS, "BOS-AMS-BA0431", True, 612.0, FLIGHT_NO["BOS-AMS-1"]),
         Leg("AMS-BCN-1", "flight", l2_dep, l2_dep + FLIGHT_TIME[(AMS, BCN)], "scheduled",
-            AMS, BCN, "AMS-BCN-IB3110", True, 214.0),
+            AMS, BCN, "AMS-BCN-IB3110", True, 214.0, FLIGHT_NO["AMS-BCN-1"]),
         Leg("BCN-HOTEL-1", "hotel", hotel_in, _local(3, 11, 0, BCN), "scheduled",
             None, BCN, "BCN-HTL-88421", False, 248.0),
         Leg("BCN-ACT-1", "activity", act, act + timedelta(hours=1, minutes=30), "scheduled",
@@ -72,9 +101,9 @@ def build_trip() -> Trip:
     return Trip(
         "TRIP-8841", legs,
         [
-            Constraint("hard", "connection at AMS: 40 min minimum", 100),
-            Constraint("hard", "hotel check-in from 15:00 CEST"),
-            Constraint("hard", "Sagrada Familia entry 17:00 CEST, non-refundable ticket"),
+            Constraint("hard", f"connection at AMS: {min_connection(AMS)} min minimum", 100),
+            Constraint("hard", f"hotel check-in from {hhmm(_local(*CHECK_IN, BCN), BCN)}"),
+            Constraint("hard", f"Sagrada Familia entry {hhmm(act, BCN)}, non-refundable ticket"),
             Constraint("soft", "extra spend ceiling: $500", 90),
             Constraint("soft", "avoid overnight airport stays", 70),
             Constraint("soft", "keep the same day arrival in Barcelona", 85),
@@ -140,6 +169,10 @@ class World:
         self.now = start or START_TIME
         self.trip = build_trip()
         self.tick_count = 0
+        # Per-world, not the module constant: committing a replan changes which flight a
+        # leg is on, and `find_alternatives` uses this to stop offering a leg its own
+        # current flight. A module-level dict would go stale on the first commit.
+        self.flight_no = dict(FLIGHT_NO)
         self._queued: list[Disruption] = []   # fired but not yet polled
         self._fired: set[str] = set()          # applied to the trip exactly once
         self._sent: set[str] = set()           # returned by poll exactly once
@@ -203,3 +236,31 @@ class World:
     def excluded_count(self, leg_id: str) -> int:
         """How many options were dropped because they had already departed."""
         return len(ALTERNATIVES.get(leg_id, [])) - len(self.alternatives(leg_id))
+
+    def option(self, leg_id: str, flight: str) -> FlightOption | None:
+        """The bookable option for `leg_id` with that flight number, or None.
+
+        The one way to get a flight out of this world. `commit_replan` goes through it
+        rather than trusting any time the model wrote, so a flight's times in a committed
+        plan are always the world's own numbers.
+        """
+        want = (flight or "").strip().upper()
+        return next((o for o in self.alternatives(leg_id) if o.flight.upper() == want), None)
+
+    # --- mutation --------------------------------------------------------------
+    def apply_replan(self, leg_id: str, option: FlightOption) -> None:
+        """Re-time a leg onto an option the world itself vouched for.
+
+        Only ever called after `commit_replan` has verified the option and cleared the
+        hard constraints, so the mutation is the last step, not the first.
+        """
+        leg = self.leg(leg_id)
+        if leg is None:
+            raise KeyError(leg_id)
+        leg.flight = option.flight
+        leg.start = option.depart
+        leg.end = option.arrive
+        leg.cost_usd += option.cost_delta_usd
+        leg.status = "rebooked"
+        leg.booking_ref = f"REBOOK-{leg_id}-{option.flight.replace(' ', '')}"
+        self.flight_no[leg_id] = option.flight
