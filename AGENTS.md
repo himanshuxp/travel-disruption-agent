@@ -19,6 +19,9 @@ only, no linter or CI to invent.
 - **The model is never the authority on whether a flight exists.** `commit_replan` must reject any leg
   whose flight number, times or cost don't appear verbatim in that leg's `find_alternatives` output. In code, not the prompt. Not optional.
 - **Datetimes are aware UTC**, converted only for display. Derive times, never write the same time down twice.
+- **`main.py` and the tests must keep working unchanged.** `app.py` is optional and may not touch them;
+  the page's own logic lives in `uicore.py`, which has no streamlit import, so tests can drive it without
+  running a page. Never call the model at import, on a rerun, or from anywhere but a button.
 - **Keep `python main.py --no-llm` working** — zero requests, deterministic scripted replan. If the plumbing is wrong, it shows.
 - **Offline tests pass before any live run**: `.venv/bin/python -m unittest discover -s tests -t .`
 
@@ -35,7 +38,8 @@ the damage and prints the counter. **Tests never make live calls.** A burst of 5
 
 ## Status
 
-**M0 + M1 done.** `get_itinerary` / `poll_disruptions` / `find_alternatives`; the model drives a
-single-leg disruption and proposes two candidates. `show_cascade()` in `main.py` is a labelled stopgap.
-**Next is M2**: `analyse_impact(leg_id)` as a model-callable tool — a deterministic dependency walk over
-`Trip.legs`, no LLM inside — then `commit_replan`, enforcing the rule above.
+**M0–M2 and M4-core done.** Five tools, `analyse_impact` walking `Trip.legs` deterministically, and
+`commit_replan` refusing any flight or time that `find_alternatives` did not return. `app.py` wraps all
+of it as a Streamlit page; approval there raises `AwaitingApproval` instead of blocking (uicore.py). 79
+offline tests, stdlib only. **Next is M3**: have the model choose between two valid options and justify
+it, rather than proposing two for a human to pick.

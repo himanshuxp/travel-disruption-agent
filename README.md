@@ -38,6 +38,16 @@ cp .env.example .env          # then paste your key in
 
 Useful flags: `--ticks N` (default 8), `--instant` (no sleep between ticks).
 
+**Optional: the Streamlit page.** Same code, wrapped — no logic of its own.
+
+```bash
+.venv/bin/pip install -r requirements-ui.txt     # streamlit only
+.venv/bin/streamlit run app.py
+```
+
+Live mode is off by default. Turn it on to spend requests; the sidebar shows the counter and
+the budget, and approval is an Approve/Decline pair rather than a terminal prompt.
+
 ## M0 + M1: what's built
 
 ```
@@ -46,7 +56,8 @@ world.py    Seeded world: the trip, the clock, the event queue, the flights that
 tools.py    get_itinerary / poll_disruptions / analyse_impact / find_alternatives / commit_replan
 agent.py    Manual dispatch loop + the retry/fallback ladder
 main.py     The ticking clock
-tests/      48 offline checks, stdlib only, no API key
+app.py      The same world as a page, wrapping main.py. uicore.py holds its approval logic.
+tests/      79 offline checks, stdlib only, no API key
 ```
 
 Run the tests with:
@@ -120,6 +131,12 @@ numbers, and it refuses any flight or time that `find_alternatives` did not retu
    day than it begins.
 4. **Ask.** An explicit `y/n` prompt in `main.py`, injected as
    `build_tools(world, approve=...)`. No handler wired means no mutation.
+
+Gate 4 has two shapes, because a terminal can block and a web page cannot. `main.py` waits
+on `input()`. The page's hook records the proposal and raises `AwaitingApproval` instead, so
+the tool returns a pending result and the Approve/Decline buttons appear on the next
+render. Approving replays the model's own plan text through the same tool, so the gates run
+again — and the model is not asked a second time, so it costs no request.
 
 **The agent has already been caught inventing times.** On the first live run it proposed
 the disrupted `BA 0431` as departing `00:15 EDT` and arriving `13:15 CEST`, when the
