@@ -8,15 +8,20 @@ spending a request. The refusal tests are the important ones: the point of commi
 is that a wrong plan changes nothing, so each one asserts the trip is byte-identical
 afterwards.
 """
+import contextlib
+import io
 import pathlib
 import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from google.genai import types  # noqa: E402
+
 import agent  # noqa: E402
+import tools  # noqa: E402
 from tools import build_tools, check_tool_sync  # noqa: E402
-from world import ALTERNATIVES, World, fmt  # noqa: E402
+from world import ALTERNATIVES, Disruption, World, fmt  # noqa: E402
 
 L1, L2 = "BOS-AMS-1", "AMS-BCN-1"
 HOTEL, ACT = "BCN-HOTEL-1", "BCN-ACT-1"
@@ -306,6 +311,69 @@ class TestCommitAcceptsIB3114(ToolHarness):
         self.assertEqual(arrival.date(), check_in.date())
 
 
+class TestApprovalPause(unittest.TestCase):
+    """An approval hook that cannot answer inline unwinds instead of guessing.
+
+    The CLI hook never raises, so everything above this class must be unaffected -- the
+    trip either commits or is declined, and never sits in limbo.
+    """
+
+    def _hook(self, raise_it=True):
+        def approve(summary, rationale):
+            self.pending = (summary, rationale)
+            if raise_it:
+                raise tools.AwaitingApproval()
+            return False
+        return approve
+
+    def setUp(self):
+        from tools import AwaitingApproval  # noqa: F401  (import kept local to the class)
+        self.world = at_event()
+        self.pending = None
+
+    def test_pending_leaves_the_trip_untouched(self):
+        impls = build_tools(self.world, approve=self._hook())
+        before = snapshot(self.world)
+        out = impls["commit_replan"]("BOS-AMS-1 = AF 0089", "lands in time")
+        self.assertTrue(out.startswith(tools.PENDING_PREFIX))
+        self.assertIn("nothing has changed", out)
+        self.assertIn("AF 0089", out)          # the proposal is shown to the traveller
+        self.assertEqual(snapshot(self.world), before)
+
+    def test_pending_never_reports_a_commit(self):
+        impls = build_tools(self.world, approve=self._hook())
+        out = impls["commit_replan"]("BOS-AMS-1 = AF 0089", "lands in time")
+        self.assertNotIn("COMMITTED", out)
+        self.assertNotIn("DECLINED", out)
+
+    def test_the_hook_still_sees_the_proposal_and_the_rationale(self):
+        """What the UI renders in its Approve dialog comes from here, not from re-deriving it."""
+        impls = build_tools(self.world, approve=self._hook())
+        impls["commit_replan"]("BOS-AMS-1 = AF 0089", "lands three hours early")
+        summary, rationale = self.pending
+        self.assertIn("AF 0089", summary)
+        self.assertIn("total extra spend: +$320", summary)
+        self.assertEqual(rationale, "lands three hours early")
+
+    def test_a_bool_hook_is_untouched_by_all_of_this(self):
+        """The whole point: main.py's input() prompt and every other test still work."""
+        for result, expected in ((True, "COMMITTED"), (False, "DECLINED")):
+            w = at_event()
+            impls = build_tools(w, approve=lambda s, r, v=result: v)
+            out = impls["commit_replan"]("BOS-AMS-1 = AF 0089", "r")
+            self.assertIn(expected, out)
+            if not result:
+                self.assertEqual(snapshot(w), snapshot(at_event()))
+
+    def test_gates_still_run_before_the_hook_is_ever_reached(self):
+        """A refusal must not leave a pending request for the UI to render."""
+        seen = []
+        impls = build_tools(self.world, approve=lambda s, r: seen.append(s) or True)
+        out = impls["commit_replan"]("BOS-AMS-1 = KL 0603\nAMS-BCN-1 = IB 3108", "cheap")
+        self.assertIn("REFUSED", out)
+        self.assertEqual(seen, [], "the approval hook was called for an illegal plan")
+
+
 class _StubClient:
     """Raises a retryable error, so the ladder runs without a network."""
 
@@ -366,6 +434,135 @@ class TestBudgetStopsTheLadder(unittest.TestCase):
         client = _StubClient(code=404)
         self.assertIsNone(agent.generate(client, None, [], "bad-model"))
         self.assertEqual(client.calls, 1)
+
+
+class _ScriptedClient:
+    """Returns canned turns in order, so the dispatch loop can be tested offline."""
+
+    def __init__(self, turns):
+        self.turns = list(turns)
+        self.seen = []
+
+    class _Models:
+        def __init__(self, outer):
+            self.outer = outer
+
+        def generate_content(self, **kwargs):
+            self.outer.seen.append(kwargs["contents"])
+            if not self.outer.turns:
+                raise AssertionError("the loop asked for more turns than were scripted")
+            return self.outer.turns.pop(0)
+
+    @property
+    def models(self):
+        return self._Models(self)
+
+
+def _call(name, args, call_id):
+    return types.FunctionCall(id=call_id, name=name, args=args)
+
+
+def _disruption():
+    return [Disruption(id="d1", at=at_event().now, kind="delay",
+                       leg_id="BOS-AMS-1", minutes=95,
+                       summary="BA 0431 delayed 95 minutes")]
+
+
+def _turn(*calls, text=None):
+    """One model turn: function calls if given, otherwise plain text."""
+    if calls:
+        # `function_calls` is a derived property on the response, not a settable field --
+        # the SDK reads it back off the candidate's parts.
+        return types.GenerateContentResponse(candidates=[types.Candidate(content=types.Content(
+            role="model", parts=[types.Part(function_call=c) for c in calls]))])
+    # `text` is also derived, off the candidate's text parts.
+    return types.GenerateContentResponse(candidates=[types.Candidate(content=types.Content(
+        role="model", parts=[types.Part.from_text(text=text)]))])
+
+
+class TestDispatchLoopIsUnchangedByEmit(unittest.TestCase):
+    """`emit` exists for app.py. The CLI passes nothing, so this pins the old output.
+
+    Every expected line here was the literal `print` argument before `emit` existed. If
+    the default path drifts, this fails -- which is the whole point of not eyeballing it.
+    """
+
+    def setUp(self):
+        self.saved = (agent.REQUESTS_USED, agent.BUDGET_SPENT,
+                      agent.REQUEST_BUDGET, agent.RETRY_DELAYS, agent.MODELS)
+        agent.REQUESTS_USED, agent.BUDGET_SPENT = 0, False
+        agent.REQUEST_BUDGET = 99
+        agent.RETRY_DELAYS = ()
+        agent.MODELS = ["stub-model"]
+
+    def tearDown(self):
+        (agent.REQUESTS_USED, agent.BUDGET_SPENT,
+         agent.REQUEST_BUDGET, agent.RETRY_DELAYS, agent.MODELS) = self.saved
+
+    def _run(self, turns, events, impls=None):
+        world = at_event()
+        tools_ = impls or {"get_itinerary": lambda: "ITIN", "poll_disruptions": lambda: "POLL"}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            agent.handle_disruption(_ScriptedClient(turns), None, tools_, world, events)
+        return buf.getvalue()
+
+    def test_tool_call_and_result_lines_are_unchanged(self):
+        out = self._run(
+            [_turn(_call("get_itinerary", {}, "c1"), text="ignored"),
+             _turn(text="AF 0089 lands in time; the hotel night survives.")],
+            _disruption())
+        self.assertEqual(out, (
+            "  [llm 1/99] stub-model\n"
+            "  -> get_itinerary({})\n"
+            "  <- ITIN\n"
+            "  [llm 2/99] stub-model\n"
+            "\nAgent: AF 0089 lands in time; the hotel night survives.\n"
+            "\n"))
+
+    def test_multiline_result_keeps_its_prefix_on_every_line(self):
+        out = self._run(
+            [_turn(_call("get_itinerary", {}, "c1"), text="x"),
+             _turn(text="done")],
+            _disruption(),
+            impls={"get_itinerary": lambda: "line one\nline two"})
+        self.assertIn("  <- line one\n  <- line two\n", out)
+
+    def test_a_tool_that_raises_becomes_text_not_a_crash(self):
+        def boom():
+            raise RuntimeError("kaboom")
+        out = self._run(
+            [_turn(_call("get_itinerary", {}, "c1"), text="x"),
+             _turn(text="recovered")],
+            _disruption(),
+            impls={"get_itinerary": boom})
+        self.assertIn("  <- error: kaboom\n", out)
+
+    def test_the_loop_stops_on_a_pending_approval(self):
+        """Otherwise the model reads 'not decided yet' as failure and spends more requests."""
+        impls = {"commit_replan": lambda *a, **k: tools.PENDING_PREFIX + " wait for the human"}
+        client = _ScriptedClient([_turn(_call("commit_replan", {"plan": "x"}, "c1"), text="x")])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            agent.handle_disruption(client, None, impls, at_event(),
+                                    _disruption())
+        self.assertEqual(client.turns, [], "the loop kept going after asking a human to decide")
+
+    def test_emit_receives_the_same_lines_split_by_kind(self):
+        world = at_event()
+        seen = []
+        client = _ScriptedClient([
+            _turn(_call("get_itinerary", {}, "c1"), text="x"),
+            _turn(text="all done")])
+        agent.handle_disruption(
+            client, None, {"get_itinerary": lambda: "ITIN"}, world,
+            _disruption(),
+            emit=lambda kind, text: seen.append((kind, text)))
+        kinds = [k for k, _ in seen]
+        self.assertEqual(kinds, ["note", "call", "result", "note", "agent"])
+        self.assertEqual(seen[1][1], "  -> get_itinerary({})")
+        self.assertEqual(seen[2][1], "  <- ITIN")
+        self.assertTrue(seen[4][1].endswith("Agent: all done\n"))
 
 
 if __name__ == "__main__":

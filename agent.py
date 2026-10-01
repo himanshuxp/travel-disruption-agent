@@ -13,6 +13,10 @@ Carried over from agent-starter/AGENTS.md on purpose:
 
 Quota: the caller only invokes this when a disruption is actually announced, and
 LLM_REQUEST_BUDGET caps the damage if that ever stops being true.
+
+Everything this module reports goes through `_say`. With no `emit` callback it prints,
+which is the CLI's behaviour and is covered by a stub-client test asserting the exact
+lines; a UI passes `emit` instead and gets the same events as data to render.
 """
 import os
 import time
@@ -20,6 +24,8 @@ import time
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
+
+from tools import PENDING_PREFIX
 
 load_dotenv()
 
@@ -41,6 +47,21 @@ def budget_left() -> int:
 def budget_message(reason: str) -> str:
     return (f"  !! request budget of {REQUEST_BUDGET} spent ({REQUESTS_USED} used): {reason}. "
             f"Raise LLM_REQUEST_BUDGET to allow more, or accept the scripted plan instead.")
+
+
+def _say(emit, kind: str, text: str) -> None:
+    """Report one thing. `emit` is None on the CLI, where that means print.
+
+    Two deliberately different shapes: events the model produced (a tool call, its result,
+    the final message) are split by kind so a UI can label them, while the operator-facing
+    lines (request counter, retries, budget) are passed through whole. Both default to the
+    exact text the CLI printed before, with no added or removed characters.
+    """
+    if emit is None:
+        print(text)
+    else:
+        emit(kind, text)
+
 
 SYSTEM_PROMPT = """You are a travel disruption agent. A traveller's booked itinerary has just been disrupted \
 and you must get them to their destination.
@@ -71,7 +92,7 @@ of inventing an option. Never write a flight number or a time you have not seen 
 - Be brief. Two candidates, a few sentences each."""
 
 
-def generate(client, config, history, model):
+def generate(client, config, history, model, emit=None):
     """One request to one model, retrying transient errors. None if it is unusable."""
     global REQUESTS_USED, BUDGET_SPENT
     for attempt in range(len(RETRY_DELAYS) + 1):
@@ -79,26 +100,35 @@ def generate(client, config, history, model):
             return None
         try:
             REQUESTS_USED += 1
-            print(f"  [llm {REQUESTS_USED}/{REQUEST_BUDGET}] {model}")
+            _say(emit, "note", f"  [llm {REQUESTS_USED}/{REQUEST_BUDGET}] {model}")
             if REQUESTS_USED >= REQUEST_BUDGET:
                 BUDGET_SPENT = True
-                print(budget_message(f"stopping after {model}"))
+                _say(emit, "note", budget_message(f"stopping after {model}"))
             return client.models.generate_content(model=model, contents=history, config=config)
         except errors.APIError as exc:
             if exc.code not in RETRY_CODES:
-                print(f"  !! {model}: {exc}")
+                _say(emit, "note", f"  !! {model}: {exc}")
                 return None
             if attempt == len(RETRY_DELAYS):
                 break
-            print(f"  .. {model} error {exc.code}; retry {attempt + 1}/{len(RETRY_DELAYS)} in {RETRY_DELAYS[attempt]}s")
+            _say(emit, "note", f"  .. {model} error {exc.code}; retry {attempt + 1}/{len(RETRY_DELAYS)} in {RETRY_DELAYS[attempt]}s")
             time.sleep(RETRY_DELAYS[attempt])
         except Exception as exc:
-            print(f"  !! {model}: {type(exc).__name__}: {exc}")
+            _say(emit, "note", f"  !! {model}: {type(exc).__name__}: {exc}")
             return None
     return None
 
 
-def handle_disruption(client, config, impls, world, events) -> None:
+def _unreachable(emit) -> None:
+    """Say why there is no answer. One message, one reason, no further retries."""
+    if BUDGET_SPENT:
+        _say(emit, "note", "\nAgent: (out of request budget - the disruption is still on the "
+                           "board, nothing was committed)")
+    else:
+        _say(emit, "note", "Agent: (model unreachable - the disruption is still on the board)")
+
+
+def handle_disruption(client, config, impls, world, events, emit=None) -> None:
     """Spend one agent call on a freshly announced disruption."""
     brief = "\n".join(f"- {e.summary} (leg {e.leg_id}, +{e.minutes} min)" for e in events)
     question = (f"New disruption just announced at {world.now:%Y-%m-%d %H:%M} UTC:\n{brief}\n\n"
@@ -110,40 +140,41 @@ def handle_disruption(client, config, impls, world, events) -> None:
         for model in MODELS:
             if BUDGET_SPENT:
                 break
-            response = generate(client, config, history, model)
+            response = generate(client, config, history, model, emit)
             if response is not None:
                 break
         else:
             history.pop()  # keep turns alternating, or the next call is rejected
-            if BUDGET_SPENT:
-                print("\nAgent: (out of request budget - the disruption is still on the board, "
-                      "nothing was committed)")
-            else:
-                print("Agent: (model unreachable - the disruption is still on the board)")
+            _unreachable(emit)
             return
         if BUDGET_SPENT:
             history.pop()
-            print("\nAgent: (out of request budget - the disruption is still on the board, "
-                  "nothing was committed)")
+            _unreachable(emit)
             return
         history.append(response.candidates[0].content)  # verbatim: keeps thought signatures
         calls = response.function_calls or []
         if not calls:
-            print(f"\nAgent: {response.text}\n")
+            _say(emit, "agent", f"\nAgent: {response.text}\n")
             return
-        parts = []
+        parts, pending = [], False
         for call in calls:
-            print(f"  -> {call.name}({call.args})")
+            _say(emit, "call", f"  -> {call.name}({call.args})")
             try:
                 result = impls[call.name](**(call.args or {}))
             except Exception as exc:
                 result = f"error: {exc}"  # the model sees it and can retry
             for line in str(result).splitlines():
-                print(f"  <- {line}")
+                _say(emit, "result", f"  <- {line}")
+            if str(result).startswith(PENDING_PREFIX):
+                pending = True
             parts.append(types.Part(function_response=types.FunctionResponse(
                 id=call.id, name=call.name, response={"result": result})))
         history.append(types.Content(role="user", parts=parts))
-    print(f"Agent: (no answer after {MAX_TURNS} tool turns)")
+        # A UI is waiting on a human decision. Stop rather than let the model read
+        # "not decided yet" as a failure and spend more requests proposing alternatives.
+        if pending:
+            return
+    _say(emit, "note", f"Agent: (no answer after {MAX_TURNS} tool turns)")
 
 
 def make_client_and_config(tools) -> tuple:

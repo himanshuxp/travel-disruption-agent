@@ -27,6 +27,19 @@ ASSIGN_RE = re.compile(r"\b([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)\s*[:=]\s*(.+)$", re.I
 # digits before it is looked up, because the world's flight numbers are zero-padded.
 FLIGHT_RE = re.compile(r"\b([A-Za-z]{2})\s*(\d{1,4})\b")
 
+# Approval normally blocks: main.py waits on input(). A UI cannot block mid-run, so an
+# approval hook may instead raise AwaitingApproval to unwind and let the decision be made
+# later. `commit_replan` turns that into a PENDING_PREFIX result for the model, and the
+# dispatch loop stops on that prefix rather than letting the model read "not decided yet"
+# as a failure and spend more requests re-proposing. A hook that returns bool -- the CLI,
+# and every test -- never raises, so this path is inert there.
+PENDING_PREFIX = "AWAITING_APPROVAL"
+
+
+class AwaitingApproval(Exception):
+    """Raised by an approval hook that cannot answer inline. Carries nothing to commit."""
+
+
 TOOLS = [types.Tool(function_declarations=[
     types.FunctionDeclaration(
         name="get_itinerary",
@@ -402,7 +415,13 @@ def build_tools(world: World, approve=None) -> dict:
             if approve is None:
                 return ("REFUSED. Nothing changed: no approval handler is wired, so this tool "
                         "will not mutate the trip unattended.")
-            if not approve(summary, rationale or "(no rationale given)"):
+            try:
+                ok = approve(summary, rationale or "(no rationale given)")
+            except AwaitingApproval:
+                return (f"{PENDING_PREFIX} the traveller has not decided yet, so nothing has "
+                        f"changed. Stop here and let them choose; do not propose another plan "
+                        f"and do not claim anything was committed.\n{summary}")
+            if not ok:
                 return "DECLINED by the traveller. Nothing changed."
 
             for row in rows:
